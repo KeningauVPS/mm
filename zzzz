@@ -1,0 +1,125 @@
+#!/bin/bash
+ 
+#apt-get update
+apt-get install -y openvpn easy-rsa
+make-cadir /opt/openvpn-ca
+cd /opt/openvpn-ca
+source vars
+./clean-all
+./build-ca  --batch
+./build-key-server --batch server
+./build-dh
+openvpn --genkey --secret keys/ta.key
+./build-key  --batch client
+ 
+ca=$(cat /opt/openvpn-ca/keys/ca.crt)
+key=$(cat /opt/openvpn-ca/keys/server.key)
+cert=$(cat /opt/openvpn-ca/keys/server.crt)
+ta=$(cat /opt/openvpn-ca/keys/ta.key)
+dh=$(cat /opt/openvpn-ca/keys/dh2048.pem)
+ 
+echo -e "
+server 10.8.0.0 255.255.0.0
+port 1195
+proto udp6
+dev tun
+topology subnet
+max-clients 2000
+ 
+comp-lzo
+push \"comp-lzo\"
+ping 10
+ping-restart 80
+push \"ping 10\"
+push \"ping-restart 60\"
+push \"redirect-gateway def1 bypass-dhcp\"
+push \"dhcp-option DNS 8.8.8.8\"
+push \"dhcp-option DNS 208.67.222.222\"
+push \"dhcp-option DNS 8.8.4.4\"
+push \"dhcp-option DNS 208.67.220.220\"
+persist-tun
+cipher AES-256-CBC
+auth SHA1
+status-version 2
+script-security 2
+reneg-sec 2592000
+hash-size 1024 1024
+max-routes-per-client 512
+verb 4
+mute 3
+client-to-client
+duplicate-cn
+replay-window 128
+user nobody
+group nogroup
+status   /var/log/openvpn-status.log
+log      /var/log/openvpn.log
+key-direction 0
+ 
+<ca>
+$ca
+</ca>
+<cert>
+$cert
+</cert>
+<key>
+$key
+</key>
+<tls-auth>
+$ta
+</tls-auth>
+<dh>
+$dh
+</dh>
+ 
+" > /etc/openvpn/server.conf
+ 
+ 
+ 
+server=$(wget http://ipinfo.io/ip -qO -)
+ca=$(cat /opt/openvpn-ca/keys/ca.crt)
+key=$(cat /opt/openvpn-ca/keys/client.key)
+cert=$(cat /opt/openvpn-ca/keys/client.crt)
+ta=$(cat /opt/openvpn-ca/keys/ta.key)
+echo "
+client
+dev tun
+dev-type tun
+nobind
+persist-tun
+cipher AES-256-CBC
+auth SHA1
+verb 2
+mute 3
+push-peer-info
+ping 10
+ping-restart 60
+hand-window 70
+server-poll-timeout 4
+reneg-sec 2592000
+sndbuf 100000
+rcvbuf 100000
+remote-cert-tls server
+key-direction 1
+comp-lzo
+resolv-retry infinite
+remote $server 1195 udp
+<ca>
+$ca
+</ca>
+<cert>
+$cert
+</cert>
+<key>
+$key
+</key>
+<tls-auth>
+$ta
+</tls-auth>
+" > ~/client.ovpn
+ 
+ 
+sysctl net.ipv4.ip_forward=1
+iptables -t nat -A POSTROUTING -s 10.8.0.0/16 -j MASQUERADE
+systemctl enable openvpn@server
+systemctl start openvpn@server
