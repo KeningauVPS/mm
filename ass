@@ -1,0 +1,92 @@
+#!/bin/bash
+
+#Update system
+sudo yum -y update >> /var/log/setup-openvpn.log 2>&1
+#Install OpenVPN & add it to startup
+sudo yum -y install openvpn >> /var/log/setup-openvpn.log 2>&1
+sudo chkconfig openvpn on >> /var/log/setup-openvpn.log 2>&1
+# Install git & clone easy-rsa
+sudo yum -y install git >> /var/log/setup-openvpn.log 2>&1
+git clone https://github.com/OpenVPN/easy-rsa.git >> /var/log/setup-openvpn.log 2>&1
+# Copy easy-rsa over & delete it from local
+sudo cp -r easy-rsa/easyrsa3 /etc/openvpn/easy-rsa >> /var/log/setup-openvpn.log 2>&1
+rm -r /home/ec2-user/easy-rsa >> /var/log/setup-openvpn.log 2>&1
+ 
+# Move vars, find public IP and put it in there, set easy-rsa home directory
+sudo cp /etc/openvpn/easy-rsa/vars.example /etc/openvpn/easy-rsa/vars >> /var/log/setup-openvpn.log 2>&1
+myip=$(curl checkip.amazonaws.com)
+echo "Found my_ip, it's $myip" >> /var/log/setup-openvpn.log 2>&1
+sudo sed -i 's/$PWD/\/etc\/openvpn\/easy-rsa/g' /etc/openvpn/easy-rsa/vars >> /var/log/setup-openvpn.log 2>&1
+sudo sed -i "s/^#set_var EASYRSA\t/set_var\t EASYRSA\t/g" /etc/openvpn/easy-rsa/vars >> /var/log/setup-openvpn.log 2>&1
+sudo sed -i "s/ChangeMe/$myip/g" /etc/openvpn/easy-rsa/vars >> /var/log/setup-openvpn.log 2>&1
+sudo sed -i "s/^#set_var\ EASYRSA_REQ_CN/set_var\ EASYRSA_REQ_CN/g" /etc/openvpn/easy-rsa/vars >> /var/log/setup-openvpn.log 2>&1
+sleep 10;
+ 
+# Build CA and generate certs
+sudo /etc/openvpn/easy-rsa/easyrsa init-pki >> /var/log/setup-openvpn.log 2>&1
+sudo /etc/openvpn/easy-rsa/easyrsa --batch build-ca nopass >> /var/log/setup-openvpn.log 2>&1
+sudo /etc/openvpn/easy-rsa/easyrsa build-server-full server nopass >> /var/log/setup-openvpn.log 2>&1
+sudo /etc/openvpn/easy-rsa/easyrsa gen-dh >> /var/log/setup-openvpn.log 2>&1
+sudo /etc/openvpn/easy-rsa/easyrsa build-client-full client nopass >> /var/log/setup-openvpn.log 2>&1
+sudo /usr/sbin/openvpn --genkey --secret /etc/openvpn/easy-rsa/ta.key >> /var/log/setup-openvpn.log 2>&1
+ 
+# Oh so ugly; PAM auth is disabled, disable and adduser nologin if you want to use it
+# From a good server.conf, you can get this from:
+# awk  '!/^;|^#|^\s*$/' server.conf |awk '{printf "%s\\n",$0}' |sed 's/"/\\"/g'
+ 
+sudo printf "port 1194\nproto udp\ndev tun\nca /etc/openvpn/easy-rsa/pki/ca.crt\nkey /etc/openvpn/easy-rsa/pki/private/server.key\ncert /etc/openvpn/easy-rsa/pki/issued/server.crt\ndh /etc/openvpn/easy-rsa/pki/dh.pem\nserver 10.8.0.0 255.255.255.0\nifconfig-pool-persist ipp.txt\npush \"redirect-gateway def1 bypass-dhcp\"\npush \"dhcp-option DNS 208.67.222.222\"\npush \"dhcp-option DNS 208.67.220.220\"\nduplicate-cn\nkeepalive 10 60\ntls-version-min 1.2 #Note: Disable if you support Chromebooks\ntls-cipher TLS-DHE-RSA-WITH-AES-256-GCM-SHA384:TLS-DHE-RSA-WITH-AES-256-CBC-SHA\ncipher AES-256-CBC\ntls-auth /etc/openvpn/easy-rsa/ta.key 0\ncomp-lzo\nuser nobody\ngroup nobody\npersist-key\npersist-tun\nstatus openvpn-status.log\nlog /var/log/openvpn.log\nverb 3\nauth SHA256\nserver-ipv6 2001:db8:0:123::/64\ntun-ipv6\npush tun-ipv6\nifconfig-ipv6 2001:db8:0:123::1 2001:db8:0:123::2\npush \"route-ipv6 2001:db8:0:abc::/64\"\npush \"route-ipv6 2000::/3\"\nproto udp6\n#plugin /usr/lib64/openvpn/plugin/lib/openvpn-auth-pam.so login" >> /etc/openvpn/server.conf
+ 
+# Set up NAT
+ 
+sudo iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o eth0 -j MASQUERADE
+sudo service iptables save
+sudo service iptables restart
+ 
+# Enable IP forwarding
+sed -i "s/net.ipv4.ip_forward = 0/net.ipv4.ip_forward = 1/g" /etc/sysctl.conf >> /var/log/setup-openvpn.log 2>&1
+sudo sysctl -p
+ 
+# start 'er up
+sudo service openvpn start
+ 
+# Install Apache for config file serving
+sudo yum -y install httpd24
+sudo chkconfig httpd on
+sudo yum -y install mod24_ssl
+ 
+# Make self-signed key for ovpn download site
+sudo openssl req -new -newkey rsa:4096 -sha256 -days 365 -nodes -x509 -keyout /etc/pki/tls/private/localhost.key -out /etc/pki/tls/certs/localhost.crt -subj "/CN=$myip/"
+ 
+# Fixup Apache
+sudo sed -i "s/#ServerName www.example.com:80/ServerName $myip/g" /etc/httpd/conf/httpd.conf >> /var/log/setup-openvpn.log 2>&1
+ >> /var/log/setup-openvpn.log 2>&1
+ 
+sudo printf "\n<VirtualHost *:80>\nServerName $myip\nRedirect / https://$myip/\n</VirtualHost>\n<VirtualHost *:443>\nServerName $myip\n</VirtualHost>\n\nServerSignature Off\nServerTokens Prod\nHeader set X-Robots-Tag \"noindex\"\n\n<IfModule headers_module>\n<FilesMatch \".ovpn$\">\nHeader Set Content-type application/x-openvpn-profile\n</FilesMatch>\n</IfModule>" >> /etc/httpd/conf/httpd.conf
+ 
+# Make download directory
+sudo mkdir /var/www/html/downloads && sudo chown apache:apache /var/www/html/downloads
+ 
+# Generate a password for the client config directory, place it in ~/ so that user can find it on login.
+# Username is vpn.
+ 
+rand_pw=`< /dev/urandom tr -dc '_A-Z-a-z-0-9!@><$%^&*()?' | head -c8`; echo $rand_pw >> /home/ec2-user/.web; htdigest_hash=`printf vpn:vpnweb:$rand_pw | md5sum -`; echo "vpn:vpnweb:${htdigest_hash:0:32}" >> /home/ec2-user/.tmp
+ 
+sudo mv /home/ec2-user/.tmp /etc/httpd/.digestauth
+sudo chown apache:apache /etc/httpd/.digestauth
+ 
+sudo chgrp ec2-user:ec2-user /home/ec2-user/.web
+ 
+sudo printf "\n<Directory \"/var/www/html/downloads\">\nAuthType Digest\nAuthName \"vpnweb\"\nAuthUserFile /etc/httpd/.digestauth\nRequire valid-user\n</Directory>" >> /etc/httpd/conf/httpd.conf
+ 
+# Start Apache
+ 
+sudo service httpd start
+ 
+# Pull client config-building script
+ 
+cd /home/ec2-user && git clone https://github.com/jenh/OVPNOncorator.git
+cd /home/ec2-user/OVPNOncorator && sudo python ovpnoncorator.py
+ 
+# Copy configs to download directory
+sudo cp /home/ec2-user/OVPNOncorator/$myip.* /var/www/html/downloads/
+sudo chown apache:apache /var/www/html/downloads/
